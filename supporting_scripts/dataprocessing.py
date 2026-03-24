@@ -219,3 +219,23 @@ def SWE_diff(basinname, output_res, medianSWEfile, WYSWEfile, decround, swedifff
         df.to_parquet(f"files/ASO/{basinname}/{output_res}M_SWE_parquet/{swedifffilename}")
 
     return df
+
+def process_MODIS_snow_water_year(df, water_year):
+    import pandas as pd
+
+    df = df.copy()
+    df["Snow_Cover"] = pd.to_numeric(df["Snow_Cover"], errors="coerce")
+
+    start_date = f"{water_year - 1}-10-01"
+    end_date = f"{water_year}-09-30"
+
+    df = df.loc[start_date:end_date].copy()
+
+    full_dates = pd.date_range(start=start_date, end=end_date, freq="D")
+    df = df.reindex(full_dates)
+    df.index.name = "Date"
+
+    df["Snow_Cover"] = df["Snow_Cover"].interpolate(method="time")
+    df["Snow_Cover"] = df["Snow_Cover"].ffill().bfill()
+
+    return df

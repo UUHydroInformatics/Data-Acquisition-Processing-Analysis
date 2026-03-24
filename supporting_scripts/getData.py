@@ -342,3 +342,43 @@ if __name__ == "__main__":
 	EndDate = sys.argv[5]
 	OutputFolder = sys.argv[6]
 	
+def get_MODIS_snow_daily(basin_polygon_coords, begin_date='2006-01-01', end_date='2012-01-01'):
+    import ee
+    import pandas as pd
+    import datetime
+
+    ee.Initialize()
+
+    basin_polygon = ee.Geometry.Polygon([basin_polygon_coords])
+
+    modis_collection = (
+        ee.ImageCollection("MODIS/061/MOD10A1")
+        .filterBounds(basin_polygon)
+        .filterDate(begin_date, end_date)
+        .select("NDSI_Snow_Cover")
+    )
+
+    def image_to_feature(img):
+        stats = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=basin_polygon,
+            scale=500,
+            maxPixels=1e13
+        )
+
+        return ee.Feature(None, {
+            "date": img.date().format("YYYY-MM-dd"),
+            "Snow_Cover": stats.get("NDSI_Snow_Cover")
+        })
+
+    fc = modis_collection.map(image_to_feature)
+    features = fc.getInfo()["features"]
+
+    df = pd.DataFrame([f["properties"] for f in features])
+
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        df.set_index("date", inplace=True)
+
+    return df
