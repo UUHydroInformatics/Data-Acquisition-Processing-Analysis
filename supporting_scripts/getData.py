@@ -74,19 +74,21 @@ def getCaliSNOTELData(SiteName, SiteID, StartDate, EndDate, OutputFolder):
         block=False  # Prevents the pool from blocking if multiple requests overlap
     )
     
-    try:
-        # Set a short 10-second timeout
-        response = http.request('GET', url, timeout=10.0)
-        print(f"Status: {response.status}")
-    except urllib3.exceptions.MaxRetryError:
-        print("Error: The HPC network cannot reach the USDA server (Check Proxy).")
-    except urllib3.exceptions.TimeoutError:
-        print("Error: The request timed out (The server or firewall is not responding).")
+    # try:
+    #     # Set a short 10-second timeout
+    #     response = http.request('GET', url, timeout=10.0)
+    #     data = response.data.decode('utf-8')
 
-    #http = urllib3.PoolManager(headers={'User-Agent': 'SNOTEL-Data-Retrieval-Agent'})
-    # print('urllib3 PoolManager created')
-    # response = http.request('GET', url)
-    # print('Data retrieved from URL')
+    #     print(f"Status: {response.status}")
+    # except urllib3.exceptions.MaxRetryError:
+    #     print("Error: The HPC network cannot reach the USDA server (Check Proxy).")
+    # except urllib3.exceptions.TimeoutError:
+    #     print("Error: The request timed out (The server or firewall is not responding).")
+
+    http = urllib3.PoolManager(headers={'User-Agent': 'SNOTEL-Data-Retrieval-Agent'})
+    print('urllib3 PoolManager created')
+    response = http.request('GET', url)
+    print('Data retrieved from URL')
     data = response.data.decode('utf-8')
     print('Data decoded from bytes to string')
     i=0
