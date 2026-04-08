@@ -1,5 +1,6 @@
 import os
 import sys
+from urllib import response
 import pytz
 import urllib3
 import datetime
@@ -22,9 +23,14 @@ def getSNOTELData(SiteName, SiteID, StateAbb, StartDate, EndDate, OutputFolder):
     url = url1+url2+url3+url4
     print(f'Start retrieving data for {SiteName}, {SiteID} \n {url}')
 
-    http = urllib3.PoolManager()
-    response = http.request('GET', url)
-    data = response.data.decode('utf-8')
+    # http = urllib3.PoolManager()
+    # response = http.request('GET', url)
+    # data = response.data.decode('utf-8')
+
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    data = response.text
+
     i=0
     for line in data.split("\n"):
         if line.startswith("#"):
@@ -108,6 +114,64 @@ def getCaliSNOTELData(SiteName, SiteID, StartDate, EndDate, OutputFolder):
     df['Water_Year'] = pd.to_datetime(df['Date']).map(lambda x: x.year+1 if x.month>9 else x.year)
 
     df.to_csv(f'./{OutputFolder}/df_{SiteID}_{StateAbb}_SNTL.csv', index=False)
+
+
+def get_Landsat_NDSI(basin_polygon_coords, StartDate, EndDate):
+    import ee
+    import pandas as pd
+
+    ee.Authenticate()
+    ee.Initialize()
+
+    basin = ee.Geometry.Polygon(basin_polygon_coords)
+
+    col = (
+        ee.ImageCollection("LANDSAT/LC08/C02/T2_L2")
+        .filterBounds(basin)
+        .filterDate(StartDate, EndDate)
+        .sort("CLOUD_COVER")
+    )
+
+    n = col.size().getInfo()
+    img_list = col.toList(n)
+
+    records = []
+
+    for i in range(n):
+        img = ee.Image(img_list.get(i))
+
+        qa = img.select("QA_PIXEL")
+        cloud_mask = (
+            qa.bitwiseAnd(1 << 1).eq(0)
+            .And(qa.bitwiseAnd(1 << 2).eq(0))
+            .And(qa.bitwiseAnd(1 << 3).eq(0))
+            .And(qa.bitwiseAnd(1 << 4).eq(0))
+        )
+
+        green = img.select("SR_B3").multiply(2.75e-05).add(-0.2)
+        swir1 = img.select("SR_B6").multiply(2.75e-05).add(-0.2)
+
+        ndsi = green.subtract(swir1).divide(green.add(swir1)).rename("NDSI")
+        ndsi = ndsi.updateMask(cloud_mask)
+
+        stat = ndsi.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=basin,
+            scale=30,
+            maxPixels=1e9,
+        ).getInfo()
+
+        if stat and stat.get("NDSI") is not None:
+            records.append({
+                "Date": pd.to_datetime(img.date().format("YYYY-MM-dd").getInfo()),
+                "NDSI": stat["NDSI"],
+            })
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.sort_values("Date").set_index("Date")
+    return df
+
 
 def convert_latlon_to_yx(lat, lon, input_crs, ds, output_crs):
     """
