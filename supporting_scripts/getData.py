@@ -1,4 +1,5 @@
 import os
+import io
 import sys
 import pytz
 import urllib3
@@ -11,6 +12,9 @@ import matplotlib.dates as mdates
 from dataretrieval import nwis
 pd.options.mode.chained_assignment = None
 
+GIMMS_START_DATE = '1981-07-01'
+GIMMS_END_DATE = '2013-12-16'
+
 def getSNOTELData(SiteName, SiteID, StateAbb, StartDate, EndDate, OutputFolder):
     #the api changed and we need to pull the site id out - 3-1-2026
     site_id = SiteID.split('_')[0]
@@ -22,28 +26,47 @@ def getSNOTELData(SiteName, SiteID, StateAbb, StartDate, EndDate, OutputFolder):
     url = url1+url2+url3+url4
     print(f'Start retrieving data for {SiteName}, {SiteID} \n {url}')
 
-    http = urllib3.PoolManager()
+    http = urllib3.PoolManager(
+        headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'text/csv,text/plain,*/*',
+            'Connection': 'keep-alive'
+        },
+        retries=urllib3.Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504]),
+        timeout=urllib3.Timeout(connect=5.0, read=30.0)
+    )
     response = http.request('GET', url)
-    data = response.data.decode('utf-8')
-    i=0
-    for line in data.split("\n"):
-        if line.startswith("#"):
-            i=i+1
-    data = data.split("\n")[i:]
+    if response.status != 200:
+        raise RuntimeError(f'Failed to retrieve SNOTEL data for {SiteID}: HTTP {response.status}')
 
-    df = pd.DataFrame.from_dict(data) 
-    df = df[0].str.split(',', expand=True)
-    df.rename(columns={0:df[0][0], 
-                        1:df[1][0]}, inplace=True)
-    df.drop(0, inplace=True)
-    df.dropna(inplace=True)
-    df.reset_index(inplace=True, drop=True)
-    df["Date"] = pd.to_datetime(df["Date"])
-    df.rename(columns={df.columns[1]:'Snow Water Equivalent (m) Start of Day Values'}, inplace=True)
-    df.iloc[:, 1:] = df.iloc[:, 1:].apply(lambda x: pd.to_numeric(x) * 0.0254)  # convert in to m
+    data = response.data.decode('utf-8')
+    lines = [line.strip() for line in data.splitlines() if line.strip() and not line.startswith('#')]
+    if not lines:
+        raise ValueError(f'No parseable data returned for {SiteID}')
+
+    csv_start = 0
+    for idx, line in enumerate(lines):
+        if line.lower().startswith('date,'):
+            csv_start = idx
+            break
+
+    csv_text = '\n'.join(lines[csv_start:])
+    df = pd.read_csv(io.StringIO(csv_text))
+    if df.shape[1] < 2:
+        preview = '\n'.join(lines[:5])
+        raise ValueError(f'Unexpected SNOTEL CSV format for {SiteID}. Preview:\n{preview}')
+
+    df = df.iloc[:, :2].copy()
+    df.columns = ['Date', 'Snow Water Equivalent (m) Start of Day Values']
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Snow Water Equivalent (m) Start of Day Values'] = pd.to_numeric(
+        df['Snow Water Equivalent (m) Start of Day Values'], errors='coerce'
+    ) * 0.0254  # convert inches to meters
+    df.dropna(subset=['Date', 'Snow Water Equivalent (m) Start of Day Values'], inplace=True)
     df['Water_Year'] = pd.to_datetime(df['Date']).map(lambda x: x.year+1 if x.month>9 else x.year)
 
-    df.to_csv(f'./{OutputFolder}/df_{SiteID}_{StateAbb}_SNTL.csv', index=False)
+    output_path = os.path.join(OutputFolder, f'df_{SiteID}_{StateAbb}_SNTL.csv')
+    df.to_csv(output_path, index=False)
 
 def getCaliSNOTELData(SiteName, SiteID, StartDate, EndDate, OutputFolder):
     StateAbb = 'Ca'
@@ -235,6 +258,55 @@ def get_usgs_streamflow(site_id, start_date="1980-01-01", end_date=datetime.date
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
+
+
+def get_GIMMS_NDVI_15day(basin_polygon_coords, begin_date=GIMMS_START_DATE, end_date=GIMMS_END_DATE):
+    import ee
+
+    dataset_start = pd.Timestamp(GIMMS_START_DATE)
+    dataset_end = pd.Timestamp(GIMMS_END_DATE)
+    begin_ts = pd.Timestamp(begin_date)
+    end_ts = pd.Timestamp(end_date if end_date is not None else GIMMS_END_DATE)
+
+    if end_ts < dataset_start or begin_ts > dataset_end:
+        raise ValueError(
+            f"Requested dates fall outside the GIMMS availability window of {GIMMS_START_DATE} to {GIMMS_END_DATE}."
+        )
+
+    begin_ts = max(begin_ts, dataset_start)
+    end_ts = min(end_ts, dataset_end)
+
+    print("Authenticating with Earth Engine...")
+    ee.Authenticate()
+    print("Initializing Earth Engine...")
+    ee.Initialize()
+    print("Earth Engine initialized successfully.")
+
+    basin_polygon = ee.Geometry.Polygon(basin_polygon_coords)
+
+    gimms_collection = (
+        ee.ImageCollection("NASA/GIMMS/3GV0")
+        .select("ndvi")
+        .filterBounds(basin_polygon)
+        .filterDate(begin_ts.strftime('%Y-%m-%d'), (end_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+    )
+
+    results = gimms_collection.map(lambda img: get_all_metrics(img, basin_polygon)).getInfo()
+    df = pd.DataFrame([feature['properties'] for feature in results['features']])
+
+    if df.empty:
+        empty_df = pd.DataFrame(columns=['ndvi'])
+        empty_df.index = pd.DatetimeIndex([], name='Date')
+        return empty_df
+
+    cols = ['date'] + [column for column in df.columns if column != 'date']
+    df = df[cols]
+    df['date'] = pd.to_datetime(df['date'].str.split('T').str[0])
+    df.rename(columns={'date': 'Date'}, inplace=True)
+    df.set_index('Date', drop=True, inplace=True)
+    df.sort_index(inplace=True)
+
+    return df
     
  #Main Data Fetcher
 def get_NLDAS_daily(basin_polygon_coords, begin_date='2025-01-01', end_date=None):
@@ -323,8 +395,6 @@ def get_NLDAS_hourly(basin_polygon_coords, begin_date = '2025-12-30', end_date =
 # Spatial Reduction Function
 def get_all_metrics(image, basin_polygon):
     import ee
-    ee.Authenticate()
-    ee.Initialize()
     stats = image.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=basin_polygon,
@@ -335,10 +405,65 @@ def get_all_metrics(image, basin_polygon):
     
 
 if __name__ == "__main__":
-	SiteName = sys.argv[1]
-	SiteID = sys.argv[2]
-	StateAbb = sys.argv[3]
-	StartDate = sys.argv[4]
-	EndDate = sys.argv[5]
-	OutputFolder = sys.argv[6]
-	
+    import argparse
+    from pynhd import NLDI
+    import dataprocessing
+
+    def _get_basin_polygon_coords(usgs_gage_id):
+        basin = NLDI().get_basins(usgs_gage_id)
+        geometry = basin.to_crs("EPSG:4326").geometry.iloc[0]
+        return list(geometry.exterior.coords)
+
+    parser = argparse.ArgumentParser(
+        description="Download basin-mean GIMMS NDVI from Earth Engine and interpolate to daily."
+    )
+    parser.add_argument("--gage-id", default="11274790",
+                        help="USGS gage ID used to define the basin through NLDI.")
+    parser.add_argument("--start-date", default=GIMMS_START_DATE,
+                        help="Start date (YYYY-MM-DD).")
+    parser.add_argument("--end-date", default=GIMMS_END_DATE,
+                        help="End date (YYYY-MM-DD).")
+    parser.add_argument("--output-folder", default="files/GIMMS",
+                        help="Folder where CSVs and plots will be written.")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    basin_polygon_coords = _get_basin_polygon_coords(args.gage_id)
+
+    gimms_15day = get_GIMMS_NDVI_15day(
+        basin_polygon_coords,
+        begin_date=args.start_date,
+        end_date=args.end_date,
+    )
+
+    gimms_daily = dataprocessing.interpolate_to_daily(gimms_15day)
+
+    gimms_15day_out = gimms_15day.copy()
+    gimms_15day_out['Date'] = gimms_15day_out.index
+    gimms_daily_out = gimms_daily.copy()
+
+    gimms_15day_csv = os.path.join(args.output_folder, f"GIMMS_NDVI_15day_{args.gage_id}.csv")
+    gimms_daily_csv = os.path.join(args.output_folder, f"GIMMS_NDVI_daily_{args.gage_id}.csv")
+    plot_path = os.path.join(args.output_folder, f"GIMMS_NDVI_{args.gage_id}.png")
+
+    gimms_15day_out.to_csv(gimms_15day_csv, index=False)
+    gimms_daily_out.to_csv(gimms_daily_csv, index=False)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(gimms_daily_out['Date'], gimms_daily_out['ndvi'],
+            label='Daily interpolated NDVI', color='forestgreen')
+    ax.scatter(gimms_15day_out['Date'], gimms_15day_out['ndvi'],
+               label='15-day GIMMS NDVI', color='black', s=12)
+    ax.set_title(f"GIMMS NDVI for Basin Upstream of USGS Gage {args.gage_id}")
+    ax.set_xlabel('Date')
+    ax.set_ylabel('NDVI')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=200)
+
+    print(f"Saved 15-day data  : {gimms_15day_csv}")
+    print(f"Saved daily data   : {gimms_daily_csv}")
+    print(f"Saved plot         : {plot_path}")
+
