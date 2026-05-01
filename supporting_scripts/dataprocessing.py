@@ -25,6 +25,49 @@ def clean_nwis_dataframe(df):
         
     return df
 
+
+def interpolate_to_daily(df, value_columns=None, date_column='Date', method='time'):
+    """
+    Resample a time-indexed dataframe to daily cadence and interpolate numeric values.
+
+    Parameters:
+    df: pandas DataFrame with either a datetime index or a datetime column.
+    value_columns: list of columns to interpolate. If None, all numeric columns are used.
+    date_column: name of the datetime column to use or restore after interpolation.
+    method: interpolation method passed to pandas.DataFrame.interpolate.
+    """
+    daily_df = df.copy()
+
+    if date_column in daily_df.columns:
+        daily_df[date_column] = pd.to_datetime(daily_df[date_column])
+        daily_df.set_index(date_column, inplace=True)
+    else:
+        daily_df.index = pd.to_datetime(daily_df.index)
+        daily_df.index.name = date_column
+
+    daily_df.sort_index(inplace=True)
+
+    if value_columns is None:
+        value_columns = daily_df.select_dtypes(include='number').columns.tolist()
+
+    daily_index = pd.date_range(daily_df.index.min(), daily_df.index.max(), freq='D')
+    daily_df = daily_df.reindex(daily_index)
+
+    if value_columns:
+        daily_df[value_columns] = daily_df[value_columns].interpolate(
+            method=method,
+            limit_direction='both'
+        )
+
+    other_columns = [column for column in daily_df.columns if column not in value_columns]
+    for column in other_columns:
+        daily_df[column] = daily_df[column].ffill().bfill()
+
+    daily_df.index.name = date_column
+    daily_df[date_column] = daily_df.index
+
+    return daily_df
+
 '''
 The function to process raw SNOTEL data for a given site and water year,
 and calculate the min, mean, median, max SWE for each day of the water year
